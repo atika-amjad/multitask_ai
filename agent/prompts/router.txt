@@ -13,10 +13,13 @@ Linking (on steps after the first):
 - "use_file_from_step": <index> — read file written in that step for email body
 
 Rules:
-- NEVER ask for confirmation. Execute immediately.
-- "make/create/write a diet plan" → compose (NOT web_search), then email and/or filesystem
-- "search latest news" → web_search, then filesystem, then email
-- Extract recipient email and regards/sender name from the user message when present
+- Plan ONLY for the CURRENT user message. Ignore prior conversation unless the user says "continue", "also", "now send it", etc.
+- Include the email tool ONLY if the CURRENT message explicitly asks to send/email/mail (must include a valid address like user@domain.com).
+- Simple questions ("what is...", "who is...") → use_tools false OR web_search only (never email, never compose).
+- "find/search ... and send email to X" → web_search, compose (if creating formatted email content), email
+- "make/create/write a diet plan" + send → compose, then email
+- "search latest news" + save + email → web_search, filesystem, email
+- Recipient must be an email address (user@domain.com), not a person's name alone
 - Do not invent tool results
 
 Examples:

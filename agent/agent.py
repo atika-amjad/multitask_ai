@@ -110,14 +110,81 @@ class Agent:
             return {"use_tools": True, "steps": steps}
         return {"use_tools": False, "reason": decision.get("reason", "")}
 
+    def _wants_email(self, text: str) -> bool:
+        if not re.search(r"\b(send|email|e-mail|mail)\b", text, re.I):
+            return False
+        if self._extract_email(text):
+            return True
+        return bool(re.search(r"\bsend\s+(?:it\s+)?to\b", text, re.I))
+
+    def _is_factual_question(self, text: str) -> bool:
+        if self._wants_email(text):
+            return False
+        if re.search(r"\b(create|make|write|draft|compose)\b", text, re.I):
+            return False
+        return bool(
+            re.match(
+                r"^(what|who|when|where|why|how|which|is|are|does|do|can|could|tell me)\b",
+                text.strip(),
+                re.I,
+            )
+        )
+
+    def _step_tool(self, step: dict[str, Any]) -> str:
+        tool, _ = self._normalize_tool_name(str(step.get("tool", "")), {})
+        return tool
+
+    def _sanitize_plan(
+        self, user_message: str, steps: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        if not steps:
+            return steps
+
+        wants_email = self._wants_email(user_message)
+        sanitized: list[dict[str, Any]] = []
+        for step in steps:
+            tool = self._step_tool(step)
+            if tool == "email" and not wants_email:
+                continue
+            sanitized.append(step)
+
+        if self._is_factual_question(user_message):
+            search_only = [s for s in sanitized if self._step_tool(s) == "web_search"]
+            if search_only:
+                return search_only[:1]
+            return [
+                {
+                    "tool": "web_search",
+                    "args": {"query": user_message, "max_results": 5},
+                }
+            ]
+
+        if wants_email and not self._extract_email(user_message):
+            sanitized = [s for s in sanitized if self._step_tool(s) != "email"]
+
+        return sanitized
+
+    def _plan_override(self, user_message: str) -> dict[str, Any] | None:
+        if self._is_factual_question(user_message):
+            return {
+                "use_tools": True,
+                "steps": [
+                    {
+                        "tool": "web_search",
+                        "args": {"query": user_message, "max_results": 5},
+                    }
+                ],
+            }
+        return None
+
     def plan(self, user_message: str) -> dict[str, Any]:
         messages = [
             {"role": "system", "content": self.router_prompt},
             {
                 "role": "user",
                 "content": (
-                    f"Conversation history:\n{self.memory.recent_context()}\n\n"
-                    f"User message:\n{user_message}"
+                    "Plan for THIS request only. Do not add email unless this message "
+                    f"explicitly asks to send/email.\n\n{user_message}"
                 ),
             },
         ]
@@ -413,12 +480,18 @@ class Agent:
             )
             return format_results(results)
         if tool == "email":
+            to = str(args.get("to", "")).strip()
+            if "@" not in to:
+                raise ValueError(
+                    f"Invalid recipient {to!r}. Use an email address (e.g. name@example.com), "
+                    "not a display name alone."
+                )
             body = str(args.get("body", ""))
             if not body.strip():
                 raise ValueError("Email body is empty — prior step may have failed")
             subject = str(args.get("subject", "")).strip() or "Latest News Update"
             return send_email(
-                str(args.get("to", "")),
+                to,
                 subject,
                 body,
                 html_body=str(args["html_body"]) if args.get("html_body") else None,
@@ -467,6 +540,28 @@ class Agent:
                 completed[-1]["args"]["bytes"] = len(str(args.get("content", "")))
         return completed
 
+    def _format_direct_reply(
+        self, user_message: str, completed: list[dict[str, Any]]
+    ) -> str | None:
+        if len(completed) != 1:
+            return None
+        item = completed[0]
+        tool = item["tool"]
+        output = str(item["output"])
+        args = item.get("args") or {}
+
+        if tool == "calculator":
+            expr = str(args.get("expression", "")).strip()
+            if expr:
+                return f"The answer is {output}. ({expr})"
+            return f"The answer is {output}."
+
+        if tool == "filesystem" and args.get("action") == "read":
+            path = args.get("path", "file")
+            return f"Contents of {path}:\n\n{output}"
+
+        return None
+
     def synthesize(
         self, user_message: str, completed: list[dict[str, Any]] | None
     ) -> str:
@@ -482,16 +577,32 @@ class Agent:
                 )
             context = "Executed tool steps:\n\n" + "\n\n".join(lines)
 
+        tools_run = {item["tool"] for item in (completed or [])}
+        if tools_run == {"web_search"}:
+            system = (
+                "Answer the user's question using the web search results below. "
+                "Be direct and informative. Do not mention email or files unless they were used."
+            )
+        elif tools_run <= {"filesystem"} and any(
+            item.get("args", {}).get("action") == "write" for item in (completed or [])
+        ):
+            system = (
+                "Summarize what was done. Mention files written with paths. "
+                "Only mention emails if an email was actually sent."
+            )
+        elif "email" in tools_run:
+            system = (
+                "Summarize what was done: files written and emails sent (recipients, subjects). "
+                "Only describe actions present in the results."
+            )
+        else:
+            system = (
+                "Answer the user based on the tool results below. Be concise and helpful. "
+                "Do not invent files or emails that were not in the results."
+            )
+
         messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a helpful multitask assistant. Summarize what was ACTUALLY "
-                    "done based only on the executed tool results below. List files written "
-                    "and emails sent with their paths/recipients. Do not ask for confirmation. "
-                    "Do not claim actions that are not in the results."
-                ),
-            },
+            {"role": "system", "content": system},
             *self.memory.to_openai_format(),
             {
                 "role": "user",
@@ -508,7 +619,7 @@ class Agent:
         self.memory.add_user(user_message)
 
         try:
-            plan = self.plan(user_message)
+            plan = self._plan_override(user_message) or self.plan(user_message)
         except Exception as exc:
             reply = f"I had trouble planning your request: {exc}"
             self.memory.add_assistant(reply)
@@ -530,9 +641,26 @@ class Agent:
             self.memory.add_assistant(reply)
             return reply
 
-        steps = self._fix_plan(
-            user_message, self._auto_link_steps(plan.get("steps") or [], user_message)
+        steps = self._sanitize_plan(
+            user_message,
+            self._fix_plan(
+                user_message,
+                self._auto_link_steps(plan.get("steps") or [], user_message),
+            ),
         )
+        if not steps:
+            messages = [
+                {
+                    "role": "system",
+                    "content": "You are a helpful multitask assistant. Answer clearly and concisely.",
+                },
+                *self.memory.to_openai_format(),
+                {"role": "user", "content": user_message},
+            ]
+            reply = self._chat(messages, temperature=0.4)
+            self.memory.add_assistant(reply)
+            return reply
+
         print(f"\n[Running {len(steps)} step(s)...]")
         try:
             completed = self.execute_plan(steps, user_message)
@@ -541,6 +669,8 @@ class Agent:
             self.memory.add_assistant(reply)
             return reply
 
-        reply = self.synthesize(user_message, completed)
+        reply = self._format_direct_reply(user_message, completed) or self.synthesize(
+            user_message, completed
+        )
         self.memory.add_assistant(reply)
         return reply

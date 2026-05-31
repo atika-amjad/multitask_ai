@@ -30,8 +30,13 @@ def _eval_node(node: ast.AST) -> float:
     raise ValueError(f"Unsupported expression: {ast.dump(node)}")
 
 
+def _normalize_expression(expression: str) -> str:
+    # ^ is XOR in Python; treat it as exponentiation (e.g. 9^2 → 9**2)
+    return expression.replace("^", "**")
+
+
 def calculate(expression: str) -> str:
-    expression = expression.strip()
+    expression = _normalize_expression(expression.strip())
     if not expression:
         raise ValueError("Expression cannot be empty")
     tree = ast.parse(expression, mode="eval")
